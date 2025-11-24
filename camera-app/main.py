@@ -1,73 +1,50 @@
 import io
-
-from picamera2 import Picamera2
-from picamera2.encoders import MJPEGEncoder, Quality
-from picamera2.outputs import FileOutput
-
+import time
 from fastapi import FastAPI
-from starlette.background import BackgroundTask
-from fastapi.responses import Response
-from fastapi.responses import StreamingResponse
-from threading import Condition
-import logging
+from fastapi.responses import Response, StreamingResponse
+from picamera2 import Picamera2
 
 app = FastAPI()
+picam2 = None
 
+@app.on_event("startup")
+def startup_event():
+    global picam2
+    picam2 = Picamera2()
+    config = picam2.create_video_configuration(main={"size": (1280, 720)})
+    picam2.configure(config)
+    picam2.start()
+
+@app.on_event("shutdown")
+def shutdown_event():
+    picam2.stop()
+    picam2.close()
 
 @app.get("/image")
 def get_image():
-    picam2 = Picamera2()
-    capture_config = picam2.create_still_configuration(main={"size": (1920, 1080)})
-    picam2.configure(capture_config)
     data = io.BytesIO()
-    picam2.start()
     picam2.capture_file(data, format="jpeg")
-    picam2.stop()
-    picam2.close()
     return Response(content=data.getvalue(), media_type="image/jpeg")
 
-
-class StreamingOutput(io.BufferedIOBase):
-    def __init__(self):
-        self.frame = None
-        self.condition = Condition()
-
-    def write(self, buf):
-        with self.condition:
-            self.frame = buf
-            self.condition.notify_all()
-
-    def read(self):
-        with self.condition:
-            self.condition.wait()
-            return self.frame
-
-
-def generate_frames(output):
+def mjpeg_generator():
     while True:
-        try:
-            frame = output.read()
-            yield (b"--frame\r\n" b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
-        except Exception as e:
-            logging.error(f"Error in generate_frames: {str(e)}")
-            break
+        # Capture JPEG into memory
+        frame = io.BytesIO()
+        picam2.capture_file(frame, format="jpeg")
 
-    print("done")
+        # Yield MJPEG frame
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" +
+            frame.getvalue() +
+            b"\r\n"
+        )
 
+        time.sleep(0.05)  # ~20 FPS (adjust as needed)
 
-@app.get("/mjpeg")
-async def mjpeg():
-    picam2 = Picamera2()
-    video_config = picam2.create_video_configuration(main={"size": (1920, 1080)})
-    picam2.configure(video_config)
-    output = StreamingOutput()
-    picam2.start_recording(MJPEGEncoder(), FileOutput(output), Quality.VERY_HIGH)
-    def stop():
-        print("Stopping recording")
-        picam2.stop_recording()
-        picam2.close()
+@app.get("/stream")
+def stream():
     return StreamingResponse(
-        generate_frames(output),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-        background=BackgroundTask(stop),
+        mjpeg_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
     )
